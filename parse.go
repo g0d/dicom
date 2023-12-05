@@ -26,6 +26,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"regexp"
 
 	"github.com/suyashkumar/dicom/pkg/charset"
 	"github.com/suyashkumar/dicom/pkg/debug"
@@ -33,6 +34,7 @@ import (
 	"github.com/suyashkumar/dicom/pkg/frame"
 	"github.com/suyashkumar/dicom/pkg/tag"
 	"github.com/suyashkumar/dicom/pkg/uid"
+	"golang.org/x/text/encoding"
 )
 
 const (
@@ -173,6 +175,10 @@ func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, 
 	return &p, nil
 }
 
+// DefaultEncodingName is value used for tag SpecificCharacterSet if it can't be
+// parsed to a valid encoding name
+const DefaultEncodingName = "ISO_IR 6"
+
 // Next parses and returns the next top-level element from the DICOM this Parser points to.
 func (p *Parser) Next() (*Element, error) {
 	if !p.reader.moreToRead() {
@@ -192,10 +198,23 @@ func (p *Parser) Next() (*Element, error) {
 
 	if elem.Tag == tag.SpecificCharacterSet {
 		encodingNames := MustGetStrings(elem.Value)
-		cs, err := charset.ParseSpecificCharacterSet(encodingNames)
+		// try parsing the original value
+		cs, err := charset.ParseSpecificCharacterSet(encodingNames, p.reader.opts.customDecoderOfSpecificCharacterSet)
+		// try fixing spelling error
 		if err != nil {
-			// unable to parse character set, hard error
-			// TODO: add option continue, even if unable to parse
+			for i := range encodingNames {
+				encodingNames[i] = FixCommonSpellingErrorInSpecificCharacterSet(encodingNames[i])
+			}
+			cs, err = charset.ParseSpecificCharacterSet(encodingNames, p.reader.opts.customDecoderOfSpecificCharacterSet)
+		}
+		// use default if other options can't be parsed
+		if err != nil {
+			for i := range encodingNames {
+				encodingNames[i] = DefaultEncodingName
+			}
+			cs, err = charset.ParseSpecificCharacterSet(encodingNames, p.reader.opts.customDecoderOfSpecificCharacterSet)
+		}
+		if err != nil {
 			return nil, err
 		}
 		p.reader.rawReader.SetCodingSystem(cs)
@@ -204,6 +223,20 @@ func (p *Parser) Next() (*Element, error) {
 	p.dataset.Elements = append(p.dataset.Elements, elem)
 	return elem, nil
 
+}
+
+// FixCommonSpellingErrorInSpecificCharacterSet references _python_encoding_for_corrected_encoding in https://github.com/pydicom/pydicom/
+func FixCommonSpellingErrorInSpecificCharacterSet(specificCharacterSet string) string {
+	fixed := DefaultEncodingName
+	if match := regexp.MustCompile(`^ISO.IR`).MatchString(specificCharacterSet); match {
+		fixed = "ISO_IR" + specificCharacterSet[6:]
+	} else if match := regexp.MustCompile(`^ISO.2022.IR.`).MatchString(specificCharacterSet); match {
+		fixed = "ISO 2022 IR " + specificCharacterSet[12:]
+	}
+	if fixed != specificCharacterSet {
+		debug.Logf("Incorrect value for Specific Character Set '%s' - assuming %s", specificCharacterSet, fixed)
+	}
+	return fixed
 }
 
 // GetMetadata returns just the set of metadata elements that have been parsed
@@ -222,11 +255,12 @@ type ParseOption func(*parseOptSet)
 
 // parseOptSet represents the flattened option set after all ParseOptions have been applied.
 type parseOptSet struct {
-	skipMetadataReadOnNewParserInit    bool
-	allowMismatchPixelDataLength       bool
-	skipPixelData                      bool
-	skipProcessingPixelDataValue       bool
-	allowMissingMetaElementGroupLength bool
+	skipMetadataReadOnNewParserInit     bool
+	allowMismatchPixelDataLength        bool
+	skipPixelData                       bool
+	skipProcessingPixelDataValue        bool
+	allowMissingMetaElementGroupLength  bool
+	customDecoderOfSpecificCharacterSet func(string) (*encoding.Decoder, error)
 }
 
 func toParseOptSet(opts ...ParseOption) parseOptSet {
@@ -235,6 +269,14 @@ func toParseOptSet(opts ...ParseOption) parseOptSet {
 		opt(&optSet)
 	}
 	return optSet
+}
+
+// WithCustomDecoderOfSpecificCharacterSet allows parser to use custom decoder for
+// non-standard character sets when assessing decoder
+func WithCustomDecoderOfSpecificCharacterSet(handler func(string) (*encoding.Decoder, error)) ParseOption {
+	return func(set *parseOptSet) {
+		set.customDecoderOfSpecificCharacterSet = handler
+	}
 }
 
 // AllowMismatchPixelDataLength allows parser to ignore an error when the length calculated from elements do not match with value length.
@@ -281,8 +323,8 @@ func SkipPixelData() ParseOption {
 // a PixelData element will be added to the dataset with the
 // PixelDataInfo.IntentionallyUnprocessed = true, and the raw bytes of the
 // entire PixelData element stored in PixelDataInfo.UnprocessedValueData.
-// 
-// In the future, we may be able to extend this functionality to support 
+//
+// In the future, we may be able to extend this functionality to support
 // on-demand processing of elements elsewhere in the library.
 func SkipProcessingPixelDataValue() ParseOption {
 	return func(set *parseOptSet) {

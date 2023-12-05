@@ -10,7 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/suyashkumar/dicom/pkg/tag"
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
 
 	"github.com/suyashkumar/dicom/pkg/frame"
 
@@ -67,6 +70,86 @@ func TestParseUntilEOF(t *testing.T) {
 					t.Errorf("dicom.Parse(%s) unexpected error: %v", f.Name(), err)
 				}
 			})
+		}
+	}
+}
+
+func TestParseFile_WithTagSpecificCharacterSetToEncodingNameConverter(t *testing.T) {
+	t.Run("invalid-tag-is-a-typo-and-with-custom-encoder-parse-succeed-but-parsed-tag-is-retained-as-original", func(t *testing.T) {
+		converter := func(charsetName string) (*encoding.Decoder, error) {
+			substitutions := map[string]*encoding.Decoder{
+				"ISO_2022_IR_6": charmap.Windows1252.NewDecoder(),
+			}
+			return substitutions[charsetName], nil
+		}
+		dataset, err := dicom.ParseFile(
+			"./testdata/malformed/specificCharacterSet_ISO_2022_IR_6.dcm",
+			nil,
+			dicom.WithCustomDecoderOfSpecificCharacterSet(converter))
+		if err != nil {
+			t.Fatalf("parsing dataset: %v", err)
+		}
+		charsetElem, err := dataset.FindElementByTag(tag.SpecificCharacterSet)
+		if err != nil {
+			t.Fatalf("find element after parsing: %v", err)
+		}
+		charset := dicom.MustGetStrings(charsetElem.Value)[0]
+		if charset != "ISO_2022_IR_6" {
+			t.Fatalf("unexpected charset after parsing: %v", charset)
+		}
+	})
+	t.Run("invalid-tag-is-a-typo-and-with-no-custom-encoder-parse-succeed-and-parsed-tag-is-fixed-in-output", func(t *testing.T) {
+		dataset, err := dicom.ParseFile("./testdata/malformed/specificCharacterSet_ISO_2022_IR_6.dcm", nil)
+		if err != nil {
+			t.Fatalf("parsing dataset: %v", err)
+		}
+		charsetElem, err := dataset.FindElementByTag(tag.SpecificCharacterSet)
+		if err != nil {
+			t.Fatalf("find element after parsing: %v", err)
+		}
+		charset := dicom.MustGetStrings(charsetElem.Value)[0]
+		if charset != "ISO 2022 IR 6" {
+			t.Fatalf("unexpected charset after parsing: %v", charset)
+		}
+	})
+	t.Run("invalid-tag-is-not-a-typo-but-with-custom-encoder-parse-succeed-and-parsed-tag-is-default-value", func(t *testing.T) {
+		dataset, err := dicom.ParseFile("./testdata/malformed/specificCharacterSet_invalid.dcm", nil)
+		if err != nil {
+			t.Fatalf("parsing dataset: %v", err)
+		}
+		charsetElem, err := dataset.FindElementByTag(tag.SpecificCharacterSet)
+		if err != nil {
+			t.Fatalf("find element after parsing: %v", err)
+		}
+		charset := dicom.MustGetStrings(charsetElem.Value)[0]
+		if charset != dicom.DefaultEncodingName {
+			t.Fatalf("unexpected charset after parsing: %v", charset)
+		}
+	})
+}
+
+func TestFixCommonSpellingErrorInSpecificCharacterSet(t *testing.T) {
+	type test struct {
+		input      string
+		wantOutput string
+	}
+	for _, te := range []test{
+		{
+			input:      "ISO_2022_IR_6",
+			wantOutput: "ISO 2022 IR 6",
+		},
+		{
+			input:      "ISO IR 13",
+			wantOutput: "ISO_IR 13",
+		},
+		{
+			input:      "invalid",
+			wantOutput: dicom.DefaultEncodingName,
+		},
+	} {
+		gotOutput := dicom.FixCommonSpellingErrorInSpecificCharacterSet(te.input)
+		if diff := cmp.Diff(te.wantOutput, gotOutput, cmp.AllowUnexported(test{})); diff != "" {
+			t.Errorf("fixCommonSpellingErrorInSpecificCharacterSet(%s) unexpected value. diff: %s", te.input, diff)
 		}
 	}
 }
